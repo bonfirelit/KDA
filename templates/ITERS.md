@@ -34,7 +34,7 @@
 - 校准: 同 session 基线 bench 3 轮，主指标中位数 <值>，3 轮 spread = <noisePct>%
   → 写入 TASK.md 终止章节作为噪声阈值；次要指标 spread 同样记录。
 - profiler 计数器特征化: <可用清单与空洞清单——空 kernel / memset 对照结果；
-  换 arch 必须重做>
+  换平台 / arch 必须重做>
 - 基线完整表:
 
   | 指标 | 值 | 备注 |

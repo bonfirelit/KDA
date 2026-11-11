@@ -9,18 +9,22 @@ description: >
   latest accepted state, and works candidates; the main session counts rounds
   and stops after 3 consecutive "no headroom" verdicts. Use when the user asks
   to "optimize kernel X", "start a kernel sandbox for X", "continue the kernel
-  campaign", or mentions kernel-opt. AMD ROCm platforms only (any gfx arch —
-  RDNA3/4, CDNA3/4 — machine profile is probed at bootstrap, not hardcoded);
-  HIP (native hipcc) and Triton-on-ROCm flavors. NOT for NVIDIA/CUDA work,
-  one-off tuning, or plain kernel Q&A.
+  campaign", or mentions kernel-opt. Platform-agnostic: any GPU/NPU with a
+  usable toolchain (NVIDIA CUDA, AMD ROCm, Triton on either backend, and other
+  vendor stacks) — platform, arch, compiler, profiler, and card-selection
+  commands are probed into a machine profile at bootstrap, never hardcoded.
+  Native compiled kernels and Triton flavors. NOT for one-off tuning or plain
+  kernel Q&A.
 ---
 
 # kernel-opt — 沙箱 + 多 agent 轮换制优化
 
-**平台范围：AMD ROCm only**（HIP native 或 Triton-on-ROCm），但**不限定 arch**——
-RDNA3/4（gfx11xx/gfx12xx）、CDNA3/4（gfx94x/gfx95x）都行。机器与 arch 特定信息
-不由本 skill 硬编码，而是 bootstrap 第 0 步探测成一份**机器档案**注入后续所有
-prompt（见 §1.0）。
+**平台范围：任意 GPU/NPU 加速器——不绑定厂商、不绑定 arch。** 常见形态：
+NVIDIA CUDA（nvcc + Nsight Compute/Systems）、AMD ROCm（hipcc + rocprofv3）、
+Triton（跑在 CUDA 或 ROCm 后端）、以及其它厂商栈（如昇腾 CANN）。平台、arch、
+编译器、profiler、选卡与钉卡方式都**不由本 skill 硬编码**，而是 bootstrap 第 0 步
+在目标机上探测成一份**机器档案**注入后续所有 prompt（见 §1.0）。唯一前提：
+目标机有可用的编译/运行工具链与一个能给出可比数字的 profiler。
 
 **按需查阅的附件**（都在本 skill 目录下，用到才读，不要预先全读）：
 
@@ -43,7 +47,7 @@ prompt（见 §1.0）。
   最终汇报里明确给出「没有进一步空间」判断（附理由：结构空间已扫、触顶证据、
   被否决方向清单）。
 - **progress**：有 candidate 被 accepted，或 agent 虽然全败但明确列出了
-  「还没来得及试」的具体假设清单。**agent 中途死亡/环境被占（GPU 忙）不算
+  「还没来得及试」的具体假设清单。**agent 中途死亡/环境被占（加速器忙）不算
   stale**——修好环境直接重启一轮，不计数。
 
 **连续 3 个 stale 轮 → 停**。accepted 任何一个 candidate 即重置计数为 0。
@@ -54,10 +58,10 @@ agent 说「没空间」不能光凭嘴说：主会话检查它至少做过一�
 **另一条立即停的路径：触顶谓词命中**。某轮 agent 报告命中 TASK.md 里声明的
 触顶谓词（如「decode weight GB/s ≥ 0.9×实测 HBM 有效带宽」）时，主会话先查
 **非空洞性**——该谓词必须已在 TASK.md Profiling 节登记过对照实验（空 kernel /
-memset 不触发它），busy 率类计数器（GRBM_*）永不可作触顶证据。非空洞则**立即
-停**（走 §3 收尾，不等 3 轮）；空洞或 TASK.md 里压根没声明该谓词，则该报告
-不算数，此轮按普通 progress/stale 归类，并在下一轮 prompt 里点名要求要么补
-对照实验、要么撤回触顶结论。
+memset 不触发它），busy 率类计数器（AMD GRBM_*、各平台的 SM/队列 busy 计数器
+等）永不可作触顶证据。非空洞则**立即停**（走 §3 收尾，不等 3 轮）；空洞或
+TASK.md 里压根没声明该谓词，则该报告不算数，此轮按普通 progress/stale 归类，
+并在下一轮 prompt 里点名要求要么补对照实验、要么撤回触顶结论。
 
 ## 1. Bootstrap（主会话亲自做，或开一个 agent 做——只用一次）
 
@@ -89,51 +93,55 @@ memset 不触发它），busy 率类计数器（GRBM_*）永不可作触顶证�
 探测并写成一小段文字，之后 bootstrap 的 build 命令、TASK.md 命令表、以及每个
 轮换 agent 的 prompt 尾部都逐字带它——机器无关性就靠这一层。**不要在档案里写
 任何你从别台机器记来的具体值——每一项都在目标机上实测**。按下表逐项探，把
-「怎么探」跑出真实结果填进档案：
+「怎么探」跑出真实结果填进档案（表里括号是常见平台的示例命令，不适用于目标机
+就换成该平台的等价工具）：
 
 | 项 | 怎么探（在目标机上跑这些，把结果填进档案） |
 |---|---|
-| arch + wave size | `rocminfo \| grep -i gfx` 取 gfx 名；查该 arch 属 RDNA（wave32）还是 CDNA（wave64）——这决定 hipcc 宏与 kernel 内 `__shfl`/协作组假设 |
-| GPU 数/显存/当前占用 | `rocm-smi`（数量、每张 VRAM 总量/已用、当前 util%）→ 据此选一张**空载卡**钉为校准卡，记下卡号 |
-| GPU 访问纪律 | 读项目/全局 CLAUDE.md；`groups` 看是否在 render 组；判断 GPU 命令是否需包裹（权限组 `sg`、容器、或直接跑）。**不假设任何机器的包裹方式——没有就直跑** |
-| 可见性变量 | 该机器用 `ROCR_VISIBLE_DEVICES` 还是 `HIP_VISIBLE_DEVICES` 钉卡（ROCm 版本相关） |
-| 工具链 | `which hipcc rocprofv3 rocminfo rocm-smi`、`hipcc --version`、`cat /opt/rocm*/.info/version` 确认 hipcc/rocprofv3 可用及 ROCm 版本；缺失则停手报告 |
-| python/venv（仅 Triton flavor 需要） | 用 origin 所属项目的 venv python 全路径；**PATH 必须带该 venv/bin，否则 JIT/后端静默回退** |
+| 平台 + arch + warp/wave size | 先确认后端（CUDA / ROCm / 其它）。arch 用平台工具取：AMD `rocminfo \| grep -i gfx`；NVIDIA `nvidia-smi --query-gpu=name,compute_cap` 或 `deviceQuery`。再查该 arch 的 warp/wave size（CUDA warp=32；AMD RDNA wave32、CDNA wave64）——这决定编译宏与 kernel 内 `__shfl`/协作组假设 |
+| 加速器数/显存/当前占用 | `nvidia-smi` 或 `rocm-smi`（按平台；数量、每张显存总量/已用、当前 util%）→ 据此选一张**空载卡**钉为校准卡，记下卡号 |
+| 加速器访问纪律 | 读项目/全局 CLAUDE.md；`groups` 看权限组；判断命令是否需包裹（权限组 `sg`、容器、或直接跑）。**不假设任何机器的包裹方式——没有就直跑** |
+| 可见性变量 | 该平台的钉卡变量：AMD `ROCR_VISIBLE_DEVICES` 或 `HIP_VISIBLE_DEVICES`（ROCm 版本相关）；NVIDIA `CUDA_VISIBLE_DEVICES`；Triton 跟随其底层后端 |
+| 工具链 | `which <编译器> <profiler> <设备查询工具>`（CUDA: `nvcc ncu nsys nvidia-smi`；ROCm: `hipcc rocprofv3 rocminfo rocm-smi`），跑版本命令（如 `nvcc --version`、`hipcc --version`）确认可用及版本；缺失则停手报告 |
+| python/venv（Triton flavor，或需要 python 驱动的测试/bench） | 用 origin 所属项目的 venv python 全路径；**PATH 必须带该 venv/bin，否则 JIT/后端静默回退** |
 | 知识库 skill | 列出目标机已安装的 kernel 知识库 skill（如有）；有则记 skill 名，无则在档案里写「无」（候选 agent 在 ITERS wiki 栏如实留空，不编造） |
 | profiler 计数器 | **先特征化再信任**（见下方警示）：空 kernel / memset / 单块延迟链对照，登记哪些计数器可信、哪些空洞 |
 
-两条跨 arch 的通用警示（撞到时补记进 TASK.md 的 Profiling/命令表节）：
+两条跨平台/跨 arch 的通用警示（撞到时补记进 TASK.md 的 Profiling/命令表节）：
 
-- **busy 率类计数器（如 GRBM_*）可能是空洞证据**：它们在某些 arch 上对空 kernel /
-  memset 也读满（是队列级 busy 而非 CU 饱和），不能当 CU 占用率或触顶证据。**任何
-  计数器在用作触顶/瓶颈证据前，先在目标机上用空 kernel + memset 对照特征化**；
-  哪些空洞随 arch 变，以目标机实测为准。
-- **wave size**：RDNA `WARP_SIZE`=32、CDNA 64，影响 hipcc 宏与 kernel 内
-  `__shfl`/协作组假设——跨 arch 移植 kernel 时这是头号编译/正确性问题来源。
-  以 `rocminfo` 实测的 wave size 为准，不凭印象。
+- **busy 率类计数器可能是空洞证据**：它们在某些平台上对空 kernel / memset 也读满
+  （是队列级 busy 而非计算单元饱和），不能当占用率或触顶证据。**任何计数器在
+  用作触顶/瓶颈证据前，先在目标机上用空 kernel + memset 对照特征化**；哪些
+  空洞随平台/arch 变，以目标机实测为准。
+- **warp/wave size 与编译目标**：CUDA warp=32；AMD RDNA wave32、CDNA wave64；
+  其它平台各有自己的 width——影响编译宏与 kernel 内 `__shfl`/协作组假设，也是
+  跨平台移植 kernel 时头号编译/正确性问题来源。以目标机实测为准，不凭印象。
 
 ### 1.1 建沙箱
 
-目录结构（HIP 与 Triton 两种 flavor；`(冻结)` 标注冻结清单成员，其余为候选可改的
-载体；`<...>` 按任务命名）：
+目录结构（原生编译与 Triton 两种 flavor；`(冻结)` 标注冻结清单成员，其余为候选
+可改的载体；`<...>` 按任务命名，`<ext>` 是后端源文件后缀，如 `.cu`/`.hip`）：
 
-**HIP flavor**
+**原生编译 flavor（Native）**
 
 ```
 <sandbox>/
-  build.sh              # hipcc --offload-arch=<arch> -std=c++17 -O3 -I include -I src
-  test.hip  -> ./test   # 正确性（冻结）：数值层 + 形状覆盖 + golden hash
-  bench.hip -> ./bench  # 性能（冻结）；iter-0 编译后拷一份 bench_base（.gitignore）
-  race.hip  -> ./race   # 独立大 grid 确定性探针（冻结）
+  build.sh              # <编译器> <arch flag> -std=c++17 -O3 -I include -I src
+  test.<ext>  -> ./test   # 正确性（冻结）：数值层 + 形状覆盖 + golden hash
+  bench.<ext> -> ./bench  # 性能（冻结）；iter-0 编译后拷一份 bench_base（.gitignore）
+  race.<ext>  -> ./race   # 独立大 grid 确定性探针（冻结）
   TASK.md  ITERS.md  .gitignore
   src/
-    <kernel>.hip        # ← 载体：候选只改这里
+    <kernel>.<ext>      # ← 载体：候选只改这里
     harness.hpp         # (冻结) host 驱动
     ref.hpp             # (冻结) 独立参考实现（CPU fp32/fp64）
   include/
     architecture_config.h  # (冻结) arch/dtype 配置头
     <其它被 include 的只读头>  # (冻结)
 ```
+
+编译器与 arch flag 按机器档案（如 `hipcc --offload-arch=<arch>`、
+`nvcc -arch=sm_<xx>`）。
 
 **Triton flavor**
 
@@ -145,29 +153,30 @@ memset 不触发它），busy 率类计数器（GRBM_*）永不可作触顶证�
   TASK.md  ITERS.md  .gitignore
 ```
 
-Triton 无 build 步骤（JIT）；测试/基准固定用上游 venv 的 python 全路径调用。
+Triton 无 build 步骤（JIT）；测试/基准固定用上游 venv 的 python 全路径调用，
+后端（CUDA/ROCm）由环境决定。
 
 读 `templates/TASK.md` 与 `templates/ITERS.md`，按其骨架创建：
 
 1. **逐字拷贝基线**：kernel 源从 origin 原样拷入，机械适配仅限 include 扁平化、
    import 改写，逐条记录（commit message + TASK.md 溯源节）。
-2. **flavor 判定**：HIP（build.sh + hipcc `--offload-arch=<档案 arch>`）或
+2. **flavor 判定**：原生编译（build.sh + 机器档案给出的编译器与 arch flag）或
    Triton（kernel_baseline.py 冻结 + 每 candidate 一个 kernel_vN.py 新文件；
    Triton 的 arch 由 JIT 从当前设备推导，不显式传）。
 3. **写冻结 harness**：test（数值层 + 形状覆盖 + golden hash + 大 grid 确定性
    探针——探针≥8 reps、毒化输出、位级比对，形状必须含 ≥8×8 块的大 grid，
    因为 sync race 只在大 grid 显现）、bench（生产形状、median-of-medians、
-   交错 A/B 支持、json 落盘）、race 独立探针（HIP: race.hip）、TASK.md、
+   交错 A/B 支持、json 落盘）、race 独立探针（原生: race.<ext>）、TASK.md、
    ITERS.md。**冻结清单** = 载体之外的一切，写进 TASK.md 并给出逐字冻结校验
    命令（`git diff --exit-code -- <清单>`）。
 4. **基线全绿**：build、test、race 探针在空载卡上跑通；跑 sandbox-vs-origin
    文件级 diff，确认只有已记录的机械适配。
-5. **HIP flavor 立刻把 iter-0 编译的 ./bench 拷成 bench_base**（交错 A/B 的
+5. **原生编译 flavor 立刻把 iter-0 编译的 ./bench 拷成 bench_base**（交错 A/B 的
    基线载体，写入 .gitignore；后续 candidate 重建不得动它——候选改了 kernel 后
    ./bench 会变，基线必须活着）。
 6. `git init` + `iter-0: baseline` commit（溯源 + 适配清单，结尾
    `Co-Authored-By: Claude Code <noreply@anthropic.com>`）。
-7. **校准**：用候选将用的同款交错纪律把基线 bench 跑 3 轮（HIP: ./bench_base
+7. **校准**：用候选将用的同款交错纪律把基线 bench 跑 3 轮（原生: ./bench_base
    三次；Triton: `bench.py kernel_baseline` 三次——Triton 注意 PATH 必须带上游
    venv/bin，否则 JIT/后端会静默回退到非目标实现），主指标取中位数，3 轮
    spread → noisePct 写进 TASK.md 终止章节；完整基线表写 ITERS.md iter-0；单独
@@ -225,7 +234,7 @@ TASK.md 性能判定节，noisePct 是硬门槛）。
    「没有进一步空间」（必须附证据：结构空间扫描结果 / 触顶对照实验 / 已否决
    方向清单——光说"想不到"不算）；
 (c) 当前 git log 最近 3 条与 git status。
-GPU 纪律与机器档案：<逐字粘贴 §1.0 的档案，含访问纪律包裹方式与校准卡号>。
+设备纪律与机器档案：<逐字粘贴 §1.0 的档案，含访问纪律包裹方式与校准卡号>。
 ```
 
 **一轮 1-3 个 candidate** 交给 agent 自裁量——单个 agent 上下文有限，塞太多会
@@ -248,9 +257,9 @@ GPU 纪律与机器档案：<逐字粘贴 §1.0 的档案，含访问纪律包�
 
 agent 死了、汇报 envBlocked、或**长时间无进展**（模型 API 连接失败：transcript
 末尾是 `API Error: Connection refused`、文件几分钟不更新、工作树干净——这是
-模型侧故障不是 GPU 故障）时：
+模型侧故障不是加速器故障）时：
 
-1. 先 `rocm-smi` 看占用、看沙箱 `git status`。
+1. 先按机器档案查设备占用（`nvidia-smi` / `rocm-smi`）、看沙箱 `git status`。
 2. 树脏了就机械恢复（`git checkout -- . && git clean -fd`，Triton 另删多余
    kernel_vN.py）；树干净则无需恢复。
 3. 重启一轮。**模型 API 死的就换另一个模型重启**（opus 死了换 sonnet，反正

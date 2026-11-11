@@ -1,4 +1,4 @@
-# TASK — <kernel 名> 优化（<arch> / ROCm <版本>）
+# TASK — <kernel 名> 优化（<平台> <arch> / <工具链> <版本>）
 
 > 模板用法：把 `<...>` 全部替换为实际值；方括号 `[...]` 是可选段，不需要就删。
 > 章节顺序固定（沿用范例先例），不要增删一级章节——轮换 agent 依赖这个结构导航。
@@ -10,7 +10,7 @@
 
 ```bash
 git status                          # 须干净（冻结文件无改动）
-<build 命令>                         # HIP flavor 才需要
+<build 命令>                         # 原生编译 flavor 才需要
 <test 命令>                          # 全 PASS（含 golden hash）
 <bench 命令>                         # 对照 ITERS.md 最后 accepted 条目数字
 ```
@@ -21,7 +21,7 @@ git status                          # 须干净（冻结文件无改动）
 ## 目标（含基线数字）
 
 - **kernel 是什么**：<一句话：做什么计算、输入输出布局>。
-- **为什么值得优化**：<占 GPU 时间的比例 / 端到端里的位置>。
+- **为什么值得优化**：<占加速器时间的比例 / 端到端里的位置>。
 - **生产形状（bench 就测这个）**：<B/T/H/D、layout、dtype、稀疏度等——最不能缺>。
 - **基线数字（iter-0）**：<主指标值 + 次要指标值，来源：校准>。
 - **验收关注点**：<除了主指标还在乎什么——功耗？别的形状不能回归？>
@@ -75,7 +75,7 @@ git diff --exit-code -- <冻结清单，逐字列出>
 4. **大 grid 确定性探针**（独立可执行）：小 grid 对照 + 8×8/16×16 interior +
    一个生产真实形状；每形状 R≥8 reps、每次 launch 前毒化输出 buffer、全部 rep
    位级比对、rep-0 另对参考。判定：reps_differ>0 → RACE；ref 对不上 → WRONG。
-   **跑在静置卡上，不与其它 GPU 负载并发。**
+   **跑在静置卡上，不与其它加速器负载并发。**
 
 ## 性能判定
 
@@ -85,9 +85,9 @@ git diff --exit-code -- <冻结清单，逐字列出>
 - **噪声阈值（校准实测）**：同 session A/A spread = <noisePct>% —— 主指标提升
   **严格大于**此值才可能采纳。**跨 session 噪声远大于同 session（本类机器实测
   量级差 10 倍以上），跨 session 数字不可比**。
-- **交错 A/B 机制**：<HIP：iter-0 编译的 ./bench 拷成 ./bench_base 与候选 ./bench
-  同 session 交替；Triton：同进程 `bench.py kernel_baseline kernel_vN` 多模块。
-  candidate 的 before 一律取同 session 重测值，不取 iter-0 历史值>。
+- **交错 A/B 机制**：<原生编译：iter-0 编译的 ./bench 拷成 ./bench_base 与候选
+  ./bench 同 session 交替；Triton：同进程 `bench.py kernel_baseline kernel_vN`
+  多模块。candidate 的 before 一律取同 session 重测值，不取 iter-0 历史值>。
 
 ## 工作流（每个 candidate 严格按序，任一步失败即停）
 
@@ -96,7 +96,7 @@ git diff --exit-code -- <冻结清单，逐字列出>
 3. **查知识库 skill**：机器档案里给了知识库 skill 名（如 KernelWiki）时，用
    Skill 工具按名调用它查询；引用条目记入 ITERS 的 wiki 栏；查不到或本机无此
    skill 时如实留空，不编造。
-4. **只改载体**。HIP：编辑 kernel 文件后 `<build 命令>`；Triton：新建
+4. **只改载体**。原生编译：编辑 kernel 文件后 `<build 命令>`；Triton：新建
    `kernel_v<N>.py`（旧文件不动）。
 5. 冻结校验（命令见上节）。
 6. `<test 命令>` 全 PASS——**挂了 = candidate 作废，bench 不跑**。
@@ -114,39 +114,42 @@ git diff --exit-code -- <冻结清单，逐字列出>
    提升都在噪声阈值内（阈值来自校准，不是硬编码）。
 2. **触顶谓词命中**——且该谓词已用对照实验证明非空洞：<写出本 kernel 的谓词，
    例「decode weight GB/s ≥ 0.9×实测 HBM 有效带宽」。注意：busy 率类计数器
-   （如 GRBM_*）对空 kernel 也读 100%，永不可作触顶证据>。
+   （各平台的 SM/队列 busy 计数器，AMD 如 GRBM_*）对空 kernel 也读 100%，
+   永不可作触顶证据>。
 3. **红线**：<按任务定，如「次要指标回归超限连续 N 次」>。
 
 ## 命令表
 
-> 逐字可粘。GPU 访问纪律按机器档案填：包裹前缀（若需，如权限组/容器包裹）与
-> 钉卡变量（`ROCR_VISIBLE_DEVICES` 或 `HIP_VISIBLE_DEVICES`，按机器档案实测）都
-> 取自机器档案，**不假设任何机器的包裹方式**。写死后不再改。
+> 逐字可粘。加速器访问纪律按机器档案填：包裹前缀（若需，如权限组/容器包裹）与
+> 钉卡变量（如 NVIDIA 的 `CUDA_VISIBLE_DEVICES`、AMD 的 `ROCR_VISIBLE_DEVICES`
+> / `HIP_VISIBLE_DEVICES`，按机器档案实测）都取自机器档案，**不假设任何机器的
+> 包裹方式**。写死后不再改。
 
 | 用途 | 命令 |
 |---|---|
-| 选卡 | `rocm-smi`（选空载卡，钉为校准卡 <gpu-id>） |
-| build | `<HIP: hipcc --offload-arch=<arch> ...；Triton: 无>` |
+| 选卡 | `<设备查询命令，按机器档案>`（如 `nvidia-smi` / `rocm-smi`；选空载卡，钉为校准卡 <gpu-id>） |
+| build | `<原生编译：<编译器> <arch flag> ...（如 hipcc --offload-arch=<arch>、nvcc -arch=sm_<xx>）；Triton: 无>` |
 | test | `<逐字>` |
 | race 探针 | `<逐字>` |
-| bench | `<逐字，含 --export json>` |
+| bench | `<逐字，含 json 落盘参数>` |
 | 冻结校验 | `git diff --exit-code -- <清单>` |
 | 知识库 | `<知识库 skill 名（如 KernelWiki），用 Skill 工具调用；无此 skill 则写「无」>` |
-| profiler | `<rocprofv3 包裹命令>`（注意：rocprofv3 `--pmc`/`--sys-trace` 输出是 SQLite `.db`，
-  不是 CSV——查询用 python sqlite3，见 Profiling 节） |
+| profiler | `<profiler 包裹命令（如 ncu/nsys、rocprofv3）>`（输出格式按平台：AMD rocprofv3 的 `--pmc`/`--sys-trace` 为 SQLite `.db` 而非 CSV，查询方式见 Profiling 节） |
 
 ## Profiling
 
 - **本机已特征化、可用的计数器**：<逐个列出 + 特征化方法>。
 - **已知空洞、不可作证据的计数器**：<逐个列出 + 空洞的对照实验现象，
-  例「GRBM_GUI_ACTIVE 对空 kernel / memset 也读 100%，是队列级 busy 而非 CU
-  饱和」>。
-- 换 arch 后**必须重新特征化**（空 kernel / 单块延迟链 / memset 对照），空洞
-  清单随 arch 变。
-- **rocprofv3 输出格式**：`--pmc <counters>` 与 `--sys-trace` 的产物是 SQLite `.db`
-  （含 `rocpd_info_pmc_*` 计数器元数据表 + `rocpd_pmc_event_*` 值表），不是 CSV。
-  查询（任一 python3 + sqlite3 标准库；表名后缀随 run 变，先
-  `SELECT name FROM sqlite_master WHERE type='table'` 探）：
+  例「<平台 busy 类计数器> 对空 kernel / memset 也读 100%，是队列级 busy 而非
+  计算单元饱和」>。
+- 换平台 / arch 后**必须重新特征化**（空 kernel / 单块延迟链 / memset 对照），
+  空洞清单随平台/arch 变。
+- **profiler 输出格式**按平台记：<按机器档案填本机 profiler 的落盘格式与查询
+  方式。如 NVIDIA 用 ncu/nsys 的报告格式；AMD rocprofv3 的 `--pmc <counters>` 与
+  `--sys-trace` 产物是 SQLite `.db`（含 `rocpd_info_pmc_*` 计数器元数据表 +
+  `rocpd_pmc_event_*` 值表），不是 CSV>。
+- **ROCm 落盘查询示例**（若本机是 AMD 平台；任一 python3 + sqlite3 标准库；
+  表名后缀随 run 变，先 `SELECT name FROM sqlite_master WHERE type='table'` 探）：
   ```sql
   SELECT i.name, SUM(e.value), COUNT(e.value)
   FROM rocpd_pmc_event_XXX e JOIN rocpd_info_pmc_XXX i ON e.pmc_id=i.id GROUP BY i.name;
