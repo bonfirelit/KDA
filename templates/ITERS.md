@@ -11,6 +11,7 @@
 ```
 ## iter-N — <一句话方向>
 - 状态: accepted | rejected | wip
+- 层: <t1 DSL / t2 native / t3 low-level>
 - commit: <hash；rejected 则写「已 revert」>
 - 假设: 改什么、为什么预期更快、预期哪层/哪段受益
 - wiki: KernelWiki 支撑条目（查不到写「无」，不编造）
@@ -23,18 +24,37 @@
 - 结论: 采纳/回退的理由（对照 TASK.md 验收规则逐条）
 ```
 
+## 层级转移条目模板
+
+```
+## tier-N — <层名> baseline（从 tier-M accepted 翻译）
+- 状态: accepted (tier baseline)
+- 上游层: tier-M iter-K commit <hash>——翻译蓝本
+- 下穿归因: <profiler / 反汇编证据：剩余差距来自上层表达力/codegen 的哪个具体
+  机制（spill、占用率、异步拷贝/流水、特定指令、指令调度等）；为何不是物理/
+  算法上限。无归因证据不允许换层>
+- 翻译说明: 保留的算法/分块/流水/融合/布局决策；低层重新表达的部分；
+  只属于上层的约束（如 DSL tile 形状）
+- 跨层 A/B（同 session）: 上层 accepted <值> → 新层基线 <值>（relPct；允许初版
+  落后，注明差距与原因）
+- 正确性: test 全 PASS?（golden 重录说明）；race 全 OK?
+- 新层校准: 同 session 3 轮 spread = <noisePct>%
+- 结论: 新层可继续优化 / 与上层差距说明 / 若到顶仍落后则整体 best 仍是上层
+```
+
 ---
 
-## iter-0 — baseline（沙箱建立 + 校准）
+## iter-0 — baseline（t<起始层>，沙箱建立 + 校准）
 
 - 状态: accepted (baseline)
+- 层: <t1 DSL / t2 native / t3 low-level>
 - commit: <baseline commit hash>
 - 溯源: <上游 repo 路径 + tag/commit；机械适配逐条列出（include 扁平化、import
   改写等），每条一行>
 - 校准: 同 session 基线 bench 3 轮，主指标中位数 <值>，3 轮 spread = <noisePct>%
   → 写入 TASK.md 终止章节作为噪声阈值；次要指标 spread 同样记录。
 - profiler 计数器特征化: <可用清单与空洞清单——空 kernel / memset 对照结果；
-  换平台 / arch 必须重做>
+  换平台 / arch / 层必须重做>
 - 基线完整表:
 
   | 指标 | 值 | 备注 |
@@ -51,8 +71,11 @@
 <!--
 ## 终止小结（收尾时由主会话追加，模板）
 
-- 命中终止条件: <二选一——(a) 连续 N 轮无空间（列出这 N 轮的结论一句话）；
-  (b) 触顶谓词命中（写明谓词内容 + 其非空洞对照实验：空 kernel/memset 不触发它）>
+- 命中终止条件: <二选一——(a) 最低适用层连续 N 轮无空间（列出这 N 轮的结论
+  一句话）；(b) 触顶谓词命中（写明谓词内容 + 其非空洞对照实验：空 kernel/memset
+  不触发它）>
+- 各层旅程: <t1/t2/t3 是否进入、各层最终主指标与主要收益、跳过的层写 N/A 原因>
+- 最终采纳层: <整体 best 所在的层与实现/commit>
 - 终态 vs iter-0: <主指标 before→after 表格 + 总收益 %>
 - accepted 迭代: <iter 号 + 一句话方向 + hash，逐条>
 - 证据指针: <关键 profiler 对照 / 反汇编落盘位置>

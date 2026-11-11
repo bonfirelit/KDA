@@ -9,12 +9,16 @@ description: >
   latest accepted state, and works candidates; the main session counts rounds
   and stops after 3 consecutive "no headroom" verdicts. Use when the user asks
   to "optimize kernel X", "start a kernel sandbox for X", "continue the kernel
-  campaign", or mentions kernel-opt. Platform-agnostic: any GPU/NPU with a
-  usable toolchain (NVIDIA CUDA, AMD ROCm, Triton on either backend, and other
-  vendor stacks) — platform, arch, compiler, profiler, and card-selection
-  commands are probed into a machine profile at bootstrap, never hardcoded.
-  Native compiled kernels and Triton flavors. NOT for one-off tuning or plain
-  kernel Q&A.
+  campaign", or mentions kernel-opt. It follows the kernel abstraction ladder:
+  optimize at the origin's own tier first (DSL such as Triton/TileLang, or
+  native CUDA/HIP), and only after that tier is exhausted translate the
+  accepted implementation down to the next tier (native, then PTX/low-level
+  asm) and keep optimizing there; a CUDA/HIP-origin kernel starts at the
+  native tier directly. Platform-agnostic: any GPU/NPU with a usable toolchain
+  (NVIDIA CUDA, AMD ROCm, Triton on either backend, and other vendor stacks) —
+  platform, arch, compiler, profiler, and card-selection commands are probed
+  into a machine profile at bootstrap, never hardcoded. Native compiled
+  kernels and Triton flavors. NOT for one-off tuning or plain kernel Q&A.
 ---
 
 # kernel-opt — 沙箱 + 多 agent 轮换制优化
@@ -25,6 +29,21 @@ Triton（跑在 CUDA 或 ROCm 后端）、以及其它厂商栈（如昇腾 CANN
 编译器、profiler、选卡与钉卡方式都**不由本 skill 硬编码**，而是 bootstrap 第 0 步
 在目标机上探测成一份**机器档案**注入后续所有 prompt（见 §1.0）。唯一前提：
 目标机有可用的编译/运行工具链与一个能给出可比数字的 profiler。
+
+**优化阶梯（tier ladder）——campaign 的主线策略**。同一个 kernel 可以在不同
+抽象层实现：上层迭代便宜、适合先扫结构空间；下层控制更细、适合压榨最后几个点。
+本 skill 按三层推进：
+
+- **t1 DSL 层**：Triton、TileLang 等高层 DSL。
+- **t2 原生层**：CUDA / HIP 原生 kernel（含 C++ 模板库写法的 kernel）。
+- **t3 低层**：PTX / 内联汇编 / arch 特定 intrinsic（NVIDIA PTX、SASS；AMD GCN
+  asm / LLVM intrinsic 等）。
+
+**起始层由 origin 的实现语言决定**：origin 是 DSL → 从 t1 开始；origin 本来就是
+CUDA/HIP → 直接从 t2 开始，**不为了走流程先绕一层 DSL**；origin 已是 PTX/asm →
+从 t3 开始。**当前层到顶后**，把该层 accepted 实现翻译到下一层、重建基线继续
+优化——翻译不是重写，保留已验证的算法、分块、流水与融合决策。**只有最低适用层
+到顶才收尾**。层级转移由主会话执行（§1.2），不是 candidate。
 
 **按需查阅的附件**（都在本 skill 目录下，用到才读，不要预先全读）：
 
@@ -38,10 +57,10 @@ Triton（跑在 CUDA 或 ROCm 后端）、以及其它厂商栈（如昇腾 CANN
 追加式日志、一迭代一 commit/revert、先查知识库再动手）都编码在模板章节里，
 照着模板填就是照着纪律做。
 
-## 0. 什么时候停（唯一权威规则）
+## 0. 什么时候停 / 什么时候换层（唯一权威规则）
 
-停不停只看**轮裁决**，不看单个 candidate 成败。每个 agent 轮结束后，主会话把该轮
-归入两类之一：
+停不停、换不换层只看**轮裁决**，不看单个 candidate 成败。stale 计数**按层独立**
+（t1/t2/t3 各自一个计数）。每个 agent 轮结束后，主会话把该轮归入两类之一：
 
 - **stale**：本轮所有 candidate 提升都在噪声内 / 被否决 / 作废，**且** agent 在
   最终汇报里明确给出「没有进一步空间」判断（附理由：结构空间已扫、触顶证据、
@@ -50,18 +69,34 @@ Triton（跑在 CUDA 或 ROCm 后端）、以及其它厂商栈（如昇腾 CANN
   「还没来得及试」的具体假设清单。**agent 中途死亡/环境被占（加速器忙）不算
   stale**——修好环境直接重启一轮，不计数。
 
-**连续 3 个 stale 轮 → 停**。accepted 任何一个 candidate 即重置计数为 0。
-agent 说「没空间」不能光凭嘴说：主会话检查它至少做过一轮**结构空间扫描**
-（多个候选方向各写最小探针测量、用数字否决，而不是空想后直接放弃），
+**当前层连续 3 个 stale 轮 → 该层到顶**。accepted 任何一个 candidate 即把当前层
+计数重置为 0。agent 说「没空间」不能光凭嘴说：主会话检查它至少做过一轮**结构
+空间扫描**（多个候选方向各写最小探针测量、用数字否决，而不是空想后直接放弃），
 否则该轮不计为 stale，打回让它把扫描做完。
 
-**另一条立即停的路径：触顶谓词命中**。某轮 agent 报告命中 TASK.md 里声明的
+**到顶后的动作**：
+
+1. **先做瓶颈归因（下穿门禁，主会话做）**：换层只允许在证据表明剩余差距来自
+   **当前层表达力 / 编译器 codegen 的限制**时进行——如无法控制寄存器与占用率、
+   寄存器 spill、不能做异步拷贝/流水/warp specialization、拿不到特定指令
+   （`cp.async.bulk`、`wgmma`、`ldmatrix`、cache policy 等）、指令调度不理想。
+   profiler / 反汇编必须把差距归因到这些机制上，并把证据写进 TASK.md 层级计划
+   （转移时也写进 ITERS 的 tier 条目）。**没有归因证据的「到顶」不允许触发
+   换层。**
+2. **归因属于物理/算法上限**（实测带宽、算力 roofline、算法结构本身）→ 换层
+   不会带来收益，不转移，直接按最低适用层处理（§3 收尾）。
+3. **归因属于层级性上限，且还有更低可用层**（以机器档案 §1.0 的「层级能力」
+   为准）→ **层级转移**（§1.2），新层计数从 0 开始，campaign 继续。
+4. **已是最低适用层** → **收尾**（§3）。
+
+**另一条立即到顶的路径：触顶谓词命中**。某轮 agent 报告命中 TASK.md 里声明的
 触顶谓词（如「decode weight GB/s ≥ 0.9×实测 HBM 有效带宽」）时，主会话先查
 **非空洞性**——该谓词必须已在 TASK.md Profiling 节登记过对照实验（空 kernel /
 memset 不触发它），busy 率类计数器（AMD GRBM_*、各平台的 SM/队列 busy 计数器
-等）永不可作触顶证据。非空洞则**立即停**（走 §3 收尾，不等 3 轮）；空洞或
-TASK.md 里压根没声明该谓词，则该报告不算数，此轮按普通 progress/stale 归类，
-并在下一轮 prompt 里点名要求要么补对照实验、要么撤回触顶结论。
+等）永不可作触顶证据。非空洞则**判定当前层立即到顶**（走上面的换层/收尾判断，
+不等 3 轮）；空洞或 TASK.md 里压根没声明该谓词，则该报告不算数，此轮按普通
+progress/stale 归类，并在下一轮 prompt 里点名要求要么补对照实验、要么撤回
+触顶结论。
 
 ## 1. Bootstrap（主会话亲自做，或开一个 agent 做——只用一次）
 
@@ -78,7 +113,8 @@ TASK.md 里压根没声明该谓词，则该报告不算数，此轮按普通 pr
 - **origin**：参数里的路径/名字。是路径就直接用；只是名字（如
   `sol_attn_exact`、`gemm_wmma`）就先在工作区/上游 repo 里定位到具体文件，把
   解析出的绝对路径**复述给用户确认**再动手——名字可能有歧义（同名 kernel 在
-  多个 repo / 多个 stage 文件里出现）。
+  多个 repo / 多个 stage 文件里出现）。同时确认它的**实现层**（t1 DSL /
+  t2 CUDA-HIP / t3 PTX-asm），这决定起始 tier；实现层与路径一起复述确认。
 - **brief**：参数里的补充说明 + kernel 是什么、为什么值得优化、**生产形状**、
   验收关注点。生产形状最不能缺——用户没给时，从 origin 的调用点/模型结构推导
   出候选值，**列给用户确认**，不要自己猜定。
@@ -103,6 +139,7 @@ TASK.md 里压根没声明该谓词，则该报告不算数，此轮按普通 pr
 | 加速器访问纪律 | 读项目/全局 CLAUDE.md；`groups` 看权限组；判断命令是否需包裹（权限组 `sg`、容器、或直接跑）。**不假设任何机器的包裹方式——没有就直跑** |
 | 可见性变量 | 该平台的钉卡变量：AMD `ROCR_VISIBLE_DEVICES` 或 `HIP_VISIBLE_DEVICES`（ROCm 版本相关）；NVIDIA `CUDA_VISIBLE_DEVICES`；Triton 跟随其底层后端 |
 | 工具链 | `which <编译器> <profiler> <设备查询工具>`（CUDA: `nvcc ncu nsys nvidia-smi`；ROCm: `hipcc rocprofv3 rocminfo rocm-smi`），跑版本命令（如 `nvcc --version`、`hipcc --version`）确认可用及版本；缺失则停手报告 |
+| 层级能力（决定阶梯能走到哪层） | t1：origin 项目 venv 里 `python -c "import triton; print(triton.__version__)"`（TileLang 同理）；t2：`nvcc`/`hipcc`；t3：PTX 内联汇编（NVIDIA，nvcc 支持）或 GCN/LLVM asm（AMD）。把「可用层集合 + 最低适用层」写进档案；某层工具链不可用就写 N/A + 证据 |
 | python/venv（Triton flavor，或需要 python 驱动的测试/bench） | 用 origin 所属项目的 venv python 全路径；**PATH 必须带该 venv/bin，否则 JIT/后端静默回退** |
 | 知识库 skill | 列出目标机已安装的 kernel 知识库 skill（如有）；有则记 skill 名，无则在档案里写「无」（候选 agent 在 ITERS wiki 栏如实留空，不编造） |
 | profiler 计数器 | **先特征化再信任**（见下方警示）：空 kernel / memset / 单块延迟链对照，登记哪些计数器可信、哪些空洞 |
@@ -122,7 +159,7 @@ TASK.md 里压根没声明该谓词，则该报告不算数，此轮按普通 pr
 目录结构（原生编译与 Triton 两种 flavor；`(冻结)` 标注冻结清单成员，其余为候选
 可改的载体；`<...>` 按任务命名，`<ext>` 是后端源文件后缀，如 `.cu`/`.hip`）：
 
-**原生编译 flavor（Native）**
+**原生编译 flavor（Native，origin 是 CUDA/HIP 时作为 t2 起始层）**
 
 ```
 <sandbox>/
@@ -143,7 +180,7 @@ TASK.md 里压根没声明该谓词，则该报告不算数，此轮按普通 pr
 编译器与 arch flag 按机器档案（如 `hipcc --offload-arch=<arch>`、
 `nvcc -arch=sm_<xx>`）。
 
-**Triton flavor**
+**Triton flavor（origin 是 DSL 时作为 t1 起始层）**
 
 ```
 <sandbox>/
@@ -155,6 +192,11 @@ TASK.md 里压根没声明该谓词，则该报告不算数，此轮按普通 pr
 
 Triton 无 build 步骤（JIT）；测试/基准固定用上游 venv 的 python 全路径调用，
 后端（CUDA/ROCm）由环境决定。
+
+**层级叠加**：上面只建**起始层**。每次层级转移（§1.2）在同一沙箱里加一个子目录
+（如 `tier2_native/`、`tier3_lowlevel/`），并保证**上一层已 accepted 的实现保持
+冻结、可编译、可运行**——跨层 A/B 和最终最优值都要能回到它。不要原地改写或删除
+上一层文件；层与层并存。
 
 读 `templates/TASK.md` 与 `templates/ITERS.md`，按其骨架创建：
 
@@ -189,6 +231,39 @@ Triton 无 build 步骤（JIT）；测试/基准固定用上游 venv 的 python 
 9. 把 noisePct、冻结清单、验收规则复述给用户，让用户 review 沙箱后再开始轮换。
    **bootstrap 只建一次**；已有沙箱继续迭代直接从 §2 进入。
 
+### 1.2 层级转移（tier transition，主会话执行）
+
+**触发**：当前层判定到顶（§0：连续 3 个 stale 轮，或非空洞触顶谓词），**且
+§0 的瓶颈归因门禁判定为层级性上限**（剩余差距来自当前层表达力/codegen 限制，
+不是物理/算法上限），且机器档案里还有更低可用层。转移是**主会话的结构性
+操作**，不是 candidate；候选 agent 不碰 harness、也不做跨层翻译。
+
+1. **冻结上一层**：把该层 accepted 实现（含其 build/运行脚本）加入冻结清单，
+   保持可编译、可运行；记录其 commit 与最终数字（跨层 A/B 的基准）。
+2. **翻译，不是重写**：以该层 accepted 实现为蓝本（**不是** origin 的原始版本），
+   把已验证的算法、分块、流水、融合与布局决策翻译到下一层语言：t1→t2 是 DSL
+   到 CUDA/HIP，t2→t3 是原生到 PTX/asm/intrinsic。翻译中发现的、只属于上层的
+   约束（如 DSL 的 tile 形状）要显式记录。
+3. **搭新层脚手架 + 改 harness**：新建层目录与 build/绑定，把新实现注册进
+   test/bench/race 的 impl 调度；harness 变更用独立的
+   `harness: tier-N support` commit，同步更新冻结清单与命令表。**先验证上一层
+   仍可跑**。
+4. **跨层 A/B（同 session）**：上一层 accepted 实现与新层基线在同一 session
+   交错测量（能同进程加载就同进程；不能则同 session 顺序跑、增加 reps 并记录
+   这一限制）。新层基线允许暂时慢于上一层（翻译初版），但必须记录差距；该层
+   优化的目标是最终超过上一层 accepted。若该层到顶仍落后，整体 best 仍是上一层。
+5. **新层基线全绿**：test 全 PASS、race 全 OK。翻译可能改变累加顺序 → golden
+   按 RECORD ME 协议重录，且**必须先过数值层**才允许重录；在 ITERS 注明。
+6. **重算新层噪声**：用新层的二进制/运行栈跑 3 轮 A/A 校准，得到该层自己的
+   noisePct（**不同层不共用阈值**），写进 TASK.md。
+7. **更新 TASK.md / ITERS.md**：当前层、命令表、冻结清单、层级计划；ITERS 追加
+   「tier-N — baseline」条目（模板见 `templates/ITERS.md`），并把 §0 的**下穿
+   归因证据**逐条写进该条目。commit `tier-N: baseline from tier-M accepted`。
+8. **该层 stale 计数从 0 开始**，按 §2 继续轮换。
+
+翻译本身可以交给一个**专门的翻译轮** agent（只改新层载体，按上面的正确性门禁
+交付初始实现），但 harness/绑定/命令表必须由主会话先搭好；该轮不计入 stale。
+
 ## 2. 轮换制（campaign 主循环）
 
 ### 启动一轮
@@ -202,16 +277,21 @@ Triton 无 build 步骤（JIT）；测试/基准固定用上游 venv 的 python 
 prompt 按下面的模板写（**不要**把 TASK.md 内容贴进去——agent 自己会读）：
 
 ```
-你是沙箱 <绝对路径> 的本轮优化者（轮 R<k>）。
+你是沙箱 <绝对路径> 的本轮优化者（轮 R<k>，当前层 t<N> <DSL|native|low-level>）。
+
+**只在当前层内工作**。层级转移（翻译到更下层）由主会话执行，不属于本轮范围：
+不要新建/改写别的层目录，不要改 harness。若判断当前层已到顶，按下面的裁决
+格式汇报，供主会话决定换层还是收尾。
 
 先读：
-1. 沙箱 TASK.md（先读首节「目录里的进度不是你的」，按其复现最近 accepted 状态：
-   git status 干净 → 冻结校验 → test → 一次 bench 对 ITERS.md 数字）
+1. 沙箱 TASK.md（先读首节「目录里的进度不是你的」，按其复现**当前层**最近
+   accepted 状态：git status 干净 → 冻结校验 → test → 一次 bench 对 ITERS.md
+   当前层数字）
 2. ITERS.md 全部条目（哪些方向被否决过、为什么——别重复已否决方向）
 
 然后按 TASK.md 的工作流做 candidate（1-3 个，做不完把剩余假设写进汇报）：
 立假设 → 查知识库（机器档案给了知识库 skill 名时，用 Skill 工具调它，如
-`KernelWiki`；查不到条目如实记「无」，不编造）→ 只改载体 →
+`KernelWiki`；查不到条目如实记「无」，不编造）→ 只改当前层载体 →
 冻结校验 → test → race 探针 → 同 session 交错 A/B bench（before = 同 session
 重测的基线）→ 取证 → ITERS.md 追加 wip 条目 → commit 或 revert（验收规则见
 TASK.md 性能判定节，noisePct 是硬门槛）。
@@ -227,6 +307,8 @@ TASK.md 性能判定节，noisePct 是硬门槛）。
 - 环境被占（另一张卡也忙 / 依赖坏）：停手汇报 envBlocked，不硬跑。
 - profiling 只能用 TASK.md Profiling 节里已特征化的计数器（空洞清单上的禁用），
   包裹命令照抄命令表。
+- 判断当前层到顶只作为裁决依据汇报；**不要自行跨层翻译、不要改 harness、不要
+  动上一层文件**——换层是主会话的 §1.2 操作。
 
 结束本轮时，最终汇报必须包含：
 (a) 本轮每个 candidate 的结局（accepted/rejected + 一句话理由）；
@@ -245,13 +327,13 @@ TASK.md 性能判定节，noisePct 是硬门槛）。
 1. **验收**：`git -C <sandbox> status` 干净、log 与汇报一致、ITERS.md 新增条目
    数字与 bench json 对得上（抽一个数复核即可；对不上就查——agent 夸大数字是
    已知风险）。
-2. **裁决归类**：progress（计数清零）或 stale（计数 +1；「没空间」判断无证据
-   支撑则打回不算，下一轮 prompt 里点名要求补结构扫描）。
-3. **决定**：满足任一终止条件 → §3 收尾——(a) stale 计数到 3，或 (b) 本轮
-   报告**非空洞触顶**（按 §0 查过对照实验登记）。否则**换成另一个模型**
-   （opus↔sonnet）启动下一轮，prompt 里附上上轮的简短结论和「上轮说没空间
-   被打回」之类的上下文。
-4. 转述给用户：本轮结局 + 当前累计收益 + stale 计数。
+2. **裁决归类**：progress（当前层计数清零）或 stale（当前层计数 +1；「没空间」
+   判断无证据支撑则打回不算，下一轮 prompt 里点名要求补结构扫描）。
+3. **决定**：当前层到顶——(a) stale 计数到 3 或 (b) 本轮报告**非空洞触顶**
+   （按 §0 查过对照实验登记）——则：还有更低可用层 → 走 §1.2 层级转移；已是
+   最低适用层 → §3 收尾。否则**换成另一个模型**（opus↔sonnet）启动下一轮，
+   prompt 里附上上轮的简短结论和「上轮说没空间被打回」之类的上下文。
+4. 转述给用户：本轮结局 + 当前累计收益 + 当前层 stale 计数 + 下一层计划。
 
 ### 中途死亡 / 环境故障
 
@@ -266,13 +348,16 @@ agent 死了、汇报 envBlocked、或**长时间无进展**（模型 API 连接
    轮换制本就要求换模型），别傻等同模型恢复。
 4. **这类轮一律不计入 stale 计数。**
 
-## 3. 收尾（连续 3 stale 后）
+## 3. 收尾（最低适用层连续 3 stale 后）
 
 主会话亲自做（读 `templates/ITERS.md` 末尾的终止小结模板）：
 
 1. ITERS.md 末尾追加**终止小结**（追加式，不改旧条目）：命中哪条终止条件
-   （连续 3 轮无空间 / 触顶谓词命中——后者要写明谓词内容与其非空洞对照实验）、
-   终态数字 vs iter-0 基线表、总收益、证据指针、剩余空间一句话。
+   （最低适用层连续 3 轮无空间 / 触顶谓词命中——后者要写明谓词内容与其非空洞
+   对照实验）、**各层旅程**（t1/t2/t3 是否进入、各层最终数字与主要收益、跳过
+   的层写原因）、终态 vs iter-0 基线表、总收益、证据指针、剩余空间一句话。
+   **最终结果取各层 accepted 实现中主指标最优者**（不一定是最低层），写清它
+   属于哪一层。
 2. `termination` commit。
-3. 转述给用户：accepted 迭代列表、总收益、剩余空间。优化合回原仓库由用户
-   另行发起，不属于本 skill。
+3. 转述给用户：accepted 迭代列表、各层收益与最终采纳层、总收益、剩余空间。
+   优化合回原仓库由用户另行发起，不属于本 skill。
